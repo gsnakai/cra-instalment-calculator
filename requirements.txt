@@ -1,0 +1,5 @@
+streamlit
+pandas
+python-dateutil
+requests
+beautifulsoup4
