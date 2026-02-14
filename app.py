@@ -21,7 +21,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-st.set_page_config(page_title="CRA Corporate Instalment Interest & Penalty (Canada)", layout="wide")
+st.set_page_config(page_title="Corporate Instalment Interest & Penalty Calculator", layout="centered")
 
 
 # ----------------------------
