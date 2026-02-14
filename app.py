@@ -1,10 +1,14 @@
 # app.py
 # CRA Corporate Instalment Interest & Penalty Calculator (Canada) — Streamlit
 #
-# What this version adds:
-# - CRA instalment base options (Option 1 / 2 / 3) and automatic required instalment schedules
-# - Monthly and quarterly Option 3 formulas per CRA examples
-# - Streamlit data_editor schema fix for empty payments table
+# Revised:
+# - Option 1/2/3 required-instalment schedules match CRA descriptions
+# - "Auto choose lowest" compares cumulative required-by-date (not just totals)
+#   so Option 3 will be chosen when it produces lower early required instalments.
+#
+# Sources:
+# - CRA instalment option descriptions (monthly & quarterly): CRA pages/FAQ
+#   (see links in the user request)
 
 import streamlit as st
 import pandas as pd
@@ -25,7 +29,6 @@ st.set_page_config(page_title="CRA Corporate Instalment Interest & Penalty (Cana
 # ----------------------------
 
 def to_date(x) -> date:
-    """Accept date/datetime/pandas timestamp/string and return datetime.date."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         raise ValueError("Missing date value.")
     if isinstance(x, date) and not isinstance(x, datetime):
@@ -164,6 +167,10 @@ def generate_due_dates(tax_year_start: date, tax_year_end: date, freq: str) -> l
     return sorted(set(due_dates))
 
 
+# ----------------------------
+# Required instalment schedules (CRA options)
+# ----------------------------
+
 def build_required_amounts_from_option(
     due_dates: list[date],
     freq: str,
@@ -173,56 +180,122 @@ def build_required_amounts_from_option(
     base_opt3: float,
 ) -> dict[date, float]:
     """
-    Builds required instalments for the tax year based on CRA option formulas.
-    Assumes a standard 12-month year (or at least the due_dates length matches 12 or 4).
+    CRA options (per CRA description):
+    Monthly:
+      Option 1: 1/12 of current-year estimate each month
+      Option 2: 1/12 of previous-year tax payable each month
+      Option 3: 1/12 of year-before-previous tax payable for first 2 months,
+                then 1/10 of (previous-year - total(first 2 payments)) for remaining 10 months
+    Quarterly (eligible small CCPC):
+      Option 1: 1/4 of current-year estimate each quarter
+      Option 2: 1/4 of previous-year tax payable each quarter
+      Option 3: 1/4 of year-before-previous tax payable for first quarter,
+                then 1/3 of (previous-year - first payment) for remaining 3 quarters
     """
     n = len(due_dates)
+    if n == 0:
+        return {}
+
+    # Map "base" by option number
+    if option == 1:
+        base = float(base_opt1)
+    elif option == 2:
+        base = float(base_opt2)
+    elif option == 3:
+        base = float(base_opt3)
+    else:
+        raise ValueError("Option must be 1, 2, or 3.")
+
     if freq == "Monthly":
-        if n == 0:
-            return {}
-        if option == 1:
-            p = base_opt1 / n
+        # Option 1/2 are even
+        if option in (1, 2):
+            p = float(base) / n
             return {d: p for d in due_dates}
-        if option == 2:
-            p = base_opt2 / n
-            return {d: p for d in due_dates}
-        # Option 3 monthly:
-        # First two payments = base3 / 12
-        # Remaining payments = (base2 - total(first two)) / (n - 2)
-        if n < 3:
-            # fallback: just spread base2 evenly
-            p = base_opt2 / n
-            return {d: p for d in due_dates}
-        first_two = base_opt3 / 12.0
-        total_first_two = first_two * 2.0
-        remaining = (base_opt2 - total_first_two) / (n - 2)
+
+        # Option 3 monthly (CRA): first 2 months based on base_opt3 / 12
+        # Remaining 10 months based on (base_opt2 - first_two_total) / 10
+        # If not a standard 12-month schedule, we still apply the CRA pattern
+        # as closely as possible: first 2 instalments use base3/12; rest spread across remaining.
+        first_two_amt = float(base_opt3) / 12.0
+        k = min(2, n)
+        first_total = first_two_amt * k
+        remaining_count = n - k
+        if remaining_count <= 0:
+            return {due_dates[i]: first_two_amt for i in range(n)}
+
+        remaining_total_basis = float(base_opt2) - first_total
+        remaining_amt = remaining_total_basis / remaining_count
+
         req = {}
         for i, d in enumerate(due_dates):
-            req[d] = first_two if i < 2 else remaining
+            req[d] = first_two_amt if i < k else remaining_amt
         return req
 
     # Quarterly
-    if n == 0:
-        return {}
-    if option == 1:
-        p = base_opt1 / n
+    if option in (1, 2):
+        p = float(base) / n
         return {d: p for d in due_dates}
-    if option == 2:
-        p = base_opt2 / n
-        return {d: p for d in due_dates}
-    # Option 3 quarterly:
-    # First payment = base3 / 4
-    # Remaining payments = (base2 - first) / (n - 1)
-    if n < 2:
-        p = base_opt2 / n
-        return {d: p for d in due_dates}
-    first = base_opt3 / 4.0
-    remaining = (base_opt2 - first) / (n - 1)
+
+    # Option 3 quarterly (CRA): first quarter based on base_opt3 / 4; remaining 3 quarters:
+    first_amt = float(base_opt3) / 4.0
+    k = 1 if n >= 1 else 0
+    first_total = first_amt * k
+    remaining_count = n - k
+    if remaining_count <= 0:
+        return {due_dates[0]: first_amt} if n == 1 else {}
+    remaining_total_basis = float(base_opt2) - first_total
+    remaining_amt = remaining_total_basis / remaining_count
+
     req = {}
     for i, d in enumerate(due_dates):
-        req[d] = first if i < 1 else remaining
+        req[d] = first_amt if i < k else remaining_amt
     return req
 
+
+def cumulative_schedule(due_dates: list[date], req: dict[date, float]) -> list[float]:
+    """Return cumulative required amounts aligned to due_dates order."""
+    cum = []
+    running = 0.0
+    for d in due_dates:
+        running += float(req.get(d, 0.0))
+        cum.append(running)
+    return cum
+
+
+def choose_cra_lowest_option(due_dates: list[date], freq: str, base1: float, base2: float, base3: float) -> tuple[int, dict[date, float]]:
+    """
+    CRA says it will assess using the option that results in the least amount payable by instalments.
+    For interest purposes, what matters is the *required cumulative amount by each due date*.
+    So we compare schedules lexicographically by cumulative required-by-date:
+      - lower at earlier due dates wins
+      - if identical throughout, tie-breaker prefers Option 3 (more “CRA typical”)
+    """
+    req1 = build_required_amounts_from_option(due_dates, freq, 1, base1, base2, base3)
+    req2 = build_required_amounts_from_option(due_dates, freq, 2, base1, base2, base3)
+    req3 = build_required_amounts_from_option(due_dates, freq, 3, base1, base2, base3)
+
+    c1 = cumulative_schedule(due_dates, req1)
+    c2 = cumulative_schedule(due_dates, req2)
+    c3 = cumulative_schedule(due_dates, req3)
+
+    # Build a comparison key: tuple(cumulative amounts..., option preference)
+    # Lower tuple is better. For ties, we prefer option 3, then 2, then 1.
+    # (So we subtract a tiny epsilon via rank; in tuple comparison, smaller is better.)
+    pref_rank = {3: 0, 2: 1, 1: 2}
+
+    candidates = [
+        (tuple(c1) + (pref_rank[1],), 1, req1),
+        (tuple(c2) + (pref_rank[2],), 2, req2),
+        (tuple(c3) + (pref_rank[3],), 3, req3),
+    ]
+    candidates.sort(key=lambda x: x[0])
+    _, opt, req = candidates[0]
+    return opt, req
+
+
+# ----------------------------
+# Interest & penalty
+# ----------------------------
 
 def compute_instalment_interest(
     tax_year_start: date,
@@ -310,7 +383,7 @@ def compute_instalment_interest(
 
 
 def compute_penalty(instalment_interest: float, interest_if_no_payments: float) -> float:
-    # CRA-style penalty threshold logic (kept as in prior version)
+    # Keeps the CRA-style threshold logic used previously.
     if instalment_interest <= 1000.0:
         return 0.0
     threshold = max(1000.0, 0.25 * interest_if_no_payments)
@@ -324,14 +397,6 @@ def compute_penalty(instalment_interest: float, interest_if_no_payments: float) 
 
 st.title("CRA Corporate Instalment Interest & Penalty Calculator (Canada)")
 
-with st.expander("What this app is doing (high level)", expanded=False):
-    st.markdown(
-        """
-- Builds the **required instalment schedule** using CRA **Option 1 / 2 / 3** instalment bases (or you can override manually).
-- Calculates instalment interest with **daily compounding** across payment/due-date/rate-change events.
-"""
-    )
-
 colA, colB, colC = st.columns(3)
 with colA:
     tax_year_start = st.date_input("Tax year start", value=date(2025, 1, 1))
@@ -344,12 +409,11 @@ with colC:
 
 freq = st.radio("Instalment frequency", ["Monthly", "Quarterly"], horizontal=True)
 due_dates = generate_due_dates(tax_year_start, tax_year_end, freq)
-st.caption(f"Generated {len(due_dates)} due dates based on your tax year and frequency.")
+st.caption(f"Generated {len(due_dates)} due dates.")
 
-st.subheader("Required instalments (CRA options)")
-
+st.subheader("Required instalments (CRA Options 1 / 2 / 3)")
 entry_mode = st.selectbox(
-    "How do you want to define the required instalments?",
+    "How do you want to define required instalments?",
     [
         "Calculate from CRA instalment bases (Option 1/2/3)",
         "Manual table (enter required amount per due date)",
@@ -360,7 +424,10 @@ entry_mode = st.selectbox(
 required_amounts: dict[date, float] = {}
 
 if entry_mode == "Calculate from CRA instalment bases (Option 1/2/3)":
-    st.markdown("Enter **instalment base amounts** (generally: tax payable minus refundable credits) from your CRA worksheet calculations.")
+    st.markdown(
+        "Enter **instalment base** amounts (from your CRA worksheets / calculations). "
+        "Option 3 uses the year-before-last base for the first 2 months (monthly) or first quarter (quarterly)."
+    )
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -370,27 +437,19 @@ if entry_mode == "Calculate from CRA instalment bases (Option 1/2/3)":
     with c3:
         base3 = st.number_input("Option 3 base (two years ago)", min_value=0.0, value=0.0, step=100.0)
 
-    choose_lowest = st.checkbox("Use the option with the lowest required instalments (CRA-allowed)", value=True)
-    if choose_lowest:
-        # compute totals for each option (for this tax year schedule)
-        req1 = build_required_amounts_from_option(due_dates, freq, 1, base1, base2, base3)
-        req2 = build_required_amounts_from_option(due_dates, freq, 2, base1, base2, base3)
-        req3 = build_required_amounts_from_option(due_dates, freq, 3, base1, base2, base3)
+    auto_choose = st.checkbox("Auto-choose CRA lowest option (based on lowest cumulative required schedule)", value=True)
 
-        tot1 = sum(req1.values())
-        tot2 = sum(req2.values())
-        tot3 = sum(req3.values())
-
-        # CRA note: option 3 total equals option 2 in standard cases; we still compute and compare.
-        best_opt = min([(tot1, 1), (tot2, 2), (tot3, 3)], key=lambda x: x[0])[1]
-        st.info(f"Using Option {best_opt} based on lowest total required instalments for the schedule.")
-        required_amounts = {1: req1, 2: req2, 3: req3}[best_opt]
+    if auto_choose:
+        chosen_opt, required_amounts = choose_cra_lowest_option(due_dates, freq, base1, base2, base3)
+        st.info(f"Chosen option: **Option {chosen_opt}** (based on lowest cumulative required-by-date schedule).")
     else:
         opt = st.radio("Pick option", [1, 2, 3], horizontal=True)
         required_amounts = build_required_amounts_from_option(due_dates, freq, opt, base1, base2, base3)
 
-    req_preview = pd.DataFrame({"due_date": list(required_amounts.keys()), "required_amount": list(required_amounts.values())})
-    req_preview = req_preview.sort_values("due_date")
+    req_preview = pd.DataFrame(
+        {"due_date": list(required_amounts.keys()), "required_amount": list(required_amounts.values())}
+    ).sort_values("due_date")
+    req_preview["cumulative_required"] = req_preview["required_amount"].cumsum()
     st.dataframe(req_preview, use_container_width=True)
 
 elif entry_mode == "Same amount each due date":
@@ -501,15 +560,7 @@ if st.button("Calculate interest + penalty", type="primary"):
         c3.metric("Interest if no payments (penalty input)", f"${int_no_pay:,.2f}")
 
         st.subheader("Breakdown (audit trail)")
-        if breakdown.empty:
-            st.write("No interest periods were generated. Check your dates and required instalments.")
-        else:
-            st.dataframe(breakdown, use_container_width=True)
-
-        st.caption(
-            "Note: This calculator assumes a standard monthly/quarterly schedule. "
-            "Special CRA rules exist (short tax years, adjusted bases, eligibility changes, etc.)."
-        )
+        st.dataframe(breakdown, use_container_width=True)
 
     except Exception as e:
         st.error(str(e))
