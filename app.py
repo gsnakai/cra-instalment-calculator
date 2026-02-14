@@ -1,5 +1,5 @@
 # app.py
-# CRA Corporate Instalment Interest & Penalty Calculator (Canada) — Streamlit
+# Corporate Instalment Interest & Penalty Calculator — Streamlit
 #
 # Revised:
 # - Option 1/2/3 required-instalment schedules match CRA descriptions
