@@ -531,9 +531,9 @@ if st.button("Calculate interest + penalty", type="primary"):
     try:
         # Normalize rate table (quarter_start must be datetime64[ns])
         rt = rate_table.copy()
-        rt["quarter_start"] = rt["quarter_start"].apply(to_date)
-        rt["quarter_start"] = pd.to_datetime(rt["quarter_start"])
-        rt = rt.sort_values("quarter_start").reset_index(drop=True)
+        rt["quarter_start"] = pd.to_datetime(rt["quarter_start"], errors="coerce").dt.normalize()
+rt = rt.sort_values("quarter_start").reset_index(drop=True)
+
 
         # Normalize payments
         pay = payments_df.copy()
