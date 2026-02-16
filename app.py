@@ -133,14 +133,26 @@ def build_rate_table_auto(from_date: date, to_date_inclusive: date) -> pd.DataFr
 
 
 def get_rate_for_day(rate_table_ts: pd.DataFrame, d: date) -> float:
+    """
+    Get the annual rate (%) applicable on date d, based on quarter_start entries.
+
+    IMPORTANT: compares using DATE ONLY to avoid time-component bugs
+    that can cause the first day of a quarter to use the previous quarter's rate.
+    """
     rt = rate_table_ts.sort_values("quarter_start").reset_index(drop=True)
-    applicable = rt[rt["quarter_start"] <= pd.Timestamp(d)]
+
+    # Compare using pure dates (drops any time component)
+    qs_dates = rt["quarter_start"].dt.date
+    applicable = rt[qs_dates <= d]
+
     if applicable.empty:
         raise ValueError(f"No interest rate available for {d}. Add the rate for its quarter.")
+
     val = applicable.iloc[-1]["annual_rate_percent"]
     if pd.isna(val):
         qs = applicable.iloc[-1]["quarter_start"].date()
         raise ValueError(f"Interest rate missing for quarter starting {qs}. Please fill it in.")
+
     return float(val)
 
 
