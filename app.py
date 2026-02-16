@@ -1,9 +1,10 @@
 # app.py
 # CRA Corporate Instalment Interest & Penalty Calculator (Canada) — Streamlit
 #
-# Fixes in this rewrite:
-# 1) Quarter rate applies correctly on the FIRST day of a new quarter (no time-component issues).
-# 2) Payment amounts allow cents (and instalments/bases also accept cents).
+# FIXES:
+# 1) Quarter rate changes apply at the BEGINNING of the quarter-start day (e.g., Oct 1 uses new rate).
+#    Implemented by splitting each accrual interval at calendar quarter boundaries (not by "rate change events").
+# 2) Payment amounts allow cents (and bases/required amounts also accept cents).
 
 import streamlit as st
 import pandas as pd
@@ -38,7 +39,7 @@ def to_date(x) -> date:
 
 
 def daterange_days(d1: date, d2: date) -> int:
-    """Number of days from d1 to d2 (d2 - d1), where d2 is the next event date."""
+    """Number of days between d1 and d2 (d2 - d1)."""
     return (d2 - d1).days
 
 
@@ -74,20 +75,8 @@ def quarter_start(d: date) -> date:
 
 
 def next_quarter_start(d: date) -> date:
-    qs = quarter_start(d)
-    return qs + relativedelta(months=3)
-
-
-def build_quarter_boundaries(start: date, end_exclusive: date) -> list[date]:
-    """Quarter start dates within [start, end_exclusive)."""
-    boundaries = []
-    cur = quarter_start(start)
-    if cur < start:
-        cur = next_quarter_start(cur)
-    while cur < end_exclusive:
-        boundaries.append(cur)
-        cur = next_quarter_start(cur)
-    return boundaries
+    """Next calendar quarter start strictly after date d's quarter."""
+    return quarter_start(d) + relativedelta(months=3)
 
 
 def month_end(d: date) -> date:
@@ -119,7 +108,7 @@ def generate_due_dates(tax_year_start: date, tax_year_end: date, freq: str) -> l
 
 
 # ----------------------------
-# CRA instalment required schedule (Options 1/2/3)
+# CRA required instalment schedules (Options 1/2/3)
 # ----------------------------
 
 def build_required_amounts_from_option(
@@ -140,8 +129,7 @@ def build_required_amounts_from_option(
       Option 2: base2 / 4 each quarter
       Option 3: first quarter = base3/4; remaining 3 = (base2 - base3/4) / 3
 
-    If due_dates length isn’t exactly 12 or 4 (non-standard year), we apply the same pattern
-    to the available number of instalments as closely as possible.
+    If due_dates count isn’t exactly 12 or 4, apply the same pattern as closely as possible.
     """
     n = len(due_dates)
     if n == 0:
@@ -182,6 +170,7 @@ def build_required_amounts_from_option(
     if option != 3:
         raise ValueError("Option must be 1, 2, or 3.")
 
+    # Option 3 quarterly
     first_amt = base3 / 4.0
     k = 1 if n >= 1 else 0
     first_total = first_amt * k
@@ -210,8 +199,8 @@ def choose_cra_lowest_option(
     base3: float
 ) -> tuple[int, dict[date, float]]:
     """
-    Choose the option with the lowest cumulative required instalments earliest.
-    This makes Option 3 win when it reduces early required amounts (even if total matches Option 2).
+    Choose option by lowest cumulative required-by-date schedule (earlier due dates matter for interest).
+    Tie-break preference: Option 3, then 2, then 1.
     """
     req1 = build_required_amounts_from_option(due_dates, freq, 1, base1, base2, base3)
     req2 = build_required_amounts_from_option(due_dates, freq, 2, base1, base2, base3)
@@ -221,9 +210,7 @@ def choose_cra_lowest_option(
     c2 = tuple(cumulative_schedule(due_dates, req2))
     c3 = tuple(cumulative_schedule(due_dates, req3))
 
-    # Tie-break preference: 3 then 2 then 1
     pref_rank = {3: 0, 2: 1, 1: 2}
-
     candidates = [
         (c1 + (pref_rank[1],), 1, req1),
         (c2 + (pref_rank[2],), 2, req2),
@@ -235,13 +222,17 @@ def choose_cra_lowest_option(
 
 
 # ----------------------------
-# Interest rates
+# Interest rates (quarter map)
 # ----------------------------
+
+def quarter_of_date(d: date) -> int:
+    return (d.month - 1) // 3 + 1
+
 
 def fetch_cra_overdue_rate_by_quarter(year: int, quarter: int) -> float | None:
     """
     Best-effort scrape CRA prescribed interest rate page for the calendar quarter.
-    If it fails (network restrictions / format change), returns None.
+    If it fails, returns None.
     """
     url = f"https://www.canada.ca/en/revenue-agency/services/tax/prescribed-interest-rates/{year}-q{quarter}.html"
     try:
@@ -266,10 +257,6 @@ def fetch_cra_overdue_rate_by_quarter(year: int, quarter: int) -> float | None:
         return None
 
 
-def quarter_of_date(d: date) -> int:
-    return (d.month - 1) // 3 + 1
-
-
 def build_rate_table_auto(from_date: date, to_date_inclusive: date) -> pd.DataFrame:
     rows = []
     cur = quarter_start(from_date)
@@ -283,10 +270,7 @@ def build_rate_table_auto(from_date: date, to_date_inclusive: date) -> pd.DataFr
 
 
 def make_rate_map(rate_table: pd.DataFrame) -> dict[date, float]:
-    """
-    Build a pure-python mapping {quarter_start_date: annual_rate_percent}
-    using python date objects ONLY (no time components).
-    """
+    """Build mapping {quarter_start_date: annual_rate_percent} using python date objects only."""
     m: dict[date, float] = {}
     for _, row in rate_table.iterrows():
         qs = to_date(row["quarter_start"])
@@ -297,15 +281,29 @@ def make_rate_map(rate_table: pd.DataFrame) -> dict[date, float]:
     return m
 
 
-def get_rate_for_day_from_map(rate_map: dict[date, float], d: date) -> float:
-    """
-    Return rate applicable for date d, based on its calendar quarter start.
-    This guarantees quarter change applies on the first day of the quarter.
-    """
+def get_rate_for_day(rate_map: dict[date, float], d: date) -> float:
+    """Rate in effect at the BEGINNING of date d."""
     qs = quarter_start(d)
     if qs not in rate_map:
         raise ValueError(f"Interest rate missing for quarter starting {qs}. Please fill it in.")
     return float(rate_map[qs])
+
+
+def split_interval_by_quarter_boundaries(start: date, end: date) -> list[tuple[date, date]]:
+    """
+    Split [start, end) into sub-intervals that do not cross a calendar quarter boundary.
+    This enforces that the new quarter's rate applies starting at 00:00 on quarter start day.
+    """
+    if end <= start:
+        return []
+    segs = []
+    cur = start
+    while cur < end:
+        nq = next_quarter_start(cur)  # next quarter start after cur's quarter
+        seg_end = min(nq, end)
+        segs.append((cur, seg_end))
+        cur = seg_end
+    return segs
 
 
 # ----------------------------
@@ -323,9 +321,8 @@ def compute_instalment_interest(
     """
     Offset-style simulation:
     - Due date: balance += required instalment
-    - Payment date: balance -= payment amount
-    - Interest accrues between events with daily compounding
-    - Rate changes handled by inserting quarter boundaries as events
+    - Payment date: balance -= payment
+    - For each interval between events, split by quarter boundaries and compound daily at correct rate
     """
     events: list[Event] = []
 
@@ -345,11 +342,7 @@ def compute_instalment_interest(
             if abs(amt) > 1e-12 and pdte <= balance_due_day:
                 events.append(Event(pdte, "Payment received", -amt))
 
-    # Quarter boundaries (rate change points)
-    for b in build_quarter_boundaries(tax_year_start, balance_due_day + timedelta(days=1)):
-        events.append(Event(b, "Rate change boundary", 0.0))
-
-    # Start and end events
+    # Start and end anchors
     events.append(Event(tax_year_start, "Tax year start", 0.0))
     events.append(Event(balance_due_day, "Balance-due day", 0.0))
 
@@ -375,32 +368,38 @@ def compute_instalment_interest(
 
     for j in range(len(combined) - 1):
         e = combined[j]
-        next_e = combined[j + 1]
+        nxt = combined[j + 1]
 
-        # Apply amounts at start of interval
+        # Apply amounts at start of the day (beginning of interval)
         balance += e.amount
 
-        days = daterange_days(e.d, next_e.d)
-        if days <= 0:
+        start = e.d
+        end = nxt.d
+        if end <= start:
             continue
 
-        rate = get_rate_for_day_from_map(rate_map, e.d)
-        factor = compound_factor(rate, days)
-        period_interest = balance * (factor - 1.0)
-        total_interest += period_interest
+        # Split by quarter boundaries so quarter changes apply at start of the quarter day
+        for seg_start, seg_end in split_interval_by_quarter_boundaries(start, end):
+            days = daterange_days(seg_start, seg_end)
+            if days <= 0:
+                continue
+            rate = get_rate_for_day(rate_map, seg_start)
+            factor = compound_factor(rate, days)
+            seg_interest = balance * (factor - 1.0)
+            total_interest += seg_interest
 
-        rows.append(
-            {
-                "from": e.d,
-                "to": next_e.d,
-                "days": days,
-                "annual_rate_%": rate,
-                "balance_during_period": balance,
-                "interest_for_period": period_interest,
-                "event_applied_on_from": e.kind,
-                "event_amount_on_from": e.amount,
-            }
-        )
+            rows.append(
+                {
+                    "from": seg_start,
+                    "to": seg_end,
+                    "days": days,
+                    "annual_rate_%": rate,
+                    "balance_during_period": balance,
+                    "interest_for_period": seg_interest,
+                    "event_applied_on_from": e.kind if seg_start == start else "Quarter boundary split",
+                    "event_amount_on_from": e.amount if seg_start == start else 0.0,
+                }
+            )
 
     return float(total_interest), pd.DataFrame(rows)
 
@@ -433,10 +432,7 @@ with colB:
     tax_year_end = st.date_input("Tax year end", value=tax_year_end_default)
 with colC:
     balance_due_day_default = tax_year_end + relativedelta(months=2)
-    balance_due_day = st.date_input(
-        "Balance-due day (instalment interest stops here)",
-        value=balance_due_day_default
-    )
+    balance_due_day = st.date_input("Balance-due day (instalment interest stops here)", value=balance_due_day_default)
 
 freq = st.radio("Instalment frequency", ["Monthly", "Quarterly"], horizontal=True)
 due_dates = generate_due_dates(tax_year_start, tax_year_end, freq)
@@ -499,7 +495,7 @@ else:
 
 st.subheader("Actual payments made")
 
-# IMPORTANT: explicit dtypes so Streamlit doesn't error when empty
+# Explicit dtypes so Streamlit doesn't error when empty
 payments_df = pd.DataFrame(
     {
         "date": pd.Series(dtype="datetime64[ns]"),
@@ -527,7 +523,12 @@ if rate_source == "Auto-load from CRA pages (best effort)":
     rate_table = build_rate_table_auto(tax_year_start, balance_due_day)
     st.info("If any rate cells are blank, fill them in manually below.")
 else:
-    qs = build_quarter_boundaries(tax_year_start, balance_due_day + timedelta(days=1))
+    # Build the quarter starts that cover the whole period (from the quarter containing tax_year_start)
+    qs = []
+    cur = quarter_start(tax_year_start)
+    while cur <= balance_due_day:
+        qs.append(cur)
+        cur = next_quarter_start(cur)
     rate_table = pd.DataFrame({"quarter_start": qs, "annual_rate_percent": [None] * len(qs)})
 
 rate_table = st.data_editor(
@@ -545,7 +546,7 @@ st.divider()
 
 if st.button("Calculate interest + penalty", type="primary"):
     try:
-        # Normalize rate table into a pure date->rate map (eliminates quarter-boundary day bugs)
+        # Build date->rate map (date-only, no time component)
         rt = rate_table.copy()
         rt["quarter_start"] = rt["quarter_start"].apply(to_date)
         rate_map = make_rate_map(rt)
@@ -556,7 +557,6 @@ if st.button("Calculate interest + penalty", type="primary"):
             pay["date"] = pd.to_datetime(pay["date"], errors="coerce")
             pay["amount"] = pd.to_numeric(pay["amount"], errors="coerce")
 
-        # Interest with actual payments
         inst_int, breakdown = compute_instalment_interest(
             tax_year_start=tax_year_start,
             balance_due_day=balance_due_day,
